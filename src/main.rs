@@ -5,12 +5,18 @@ use anyhow::Context as _;
 use clap::Parser as _;
 use futures::{StreamExt, TryStreamExt};
 
+mod imp;
+
 #[derive(clap::Parser)]
 struct Command {
     event_handle: Option<String>,
     event_edition: Option<u32>,
-    #[arg(long, short, default_value_t = String::from("./"))]
+    #[arg(long, short, default_value = "./")]
     out: String,
+
+    #[cfg(feature = "localhost_test")]
+    #[arg(long, default_value = "http://localhost:3001")]
+    host: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -44,28 +50,25 @@ impl fmt::Display for EventEdition {
     }
 }
 
-#[tracing::instrument(skip(client), err, ret(Display))]
+#[cfg(all(debug_assertions, feature = "localhost_test"))]
+#[inline(always)]
+async fn get_event_edition(
+    client: &reqwest::Client,
+    host: &str,
+    handle: &str,
+    edition: u32,
+) -> anyhow::Result<EventEdition> {
+    imp::get_event_edition(client, host, handle, edition).await
+}
+
+#[cfg(not(all(debug_assertions, feature = "localhost_test")))]
+#[inline(always)]
 async fn get_event_edition(
     client: &reqwest::Client,
     handle: &str,
     edition: u32,
 ) -> anyhow::Result<EventEdition> {
-    #[cfg(feature = "localhost_test")]
-    let url = format!("http://localhost:3001/event/{}/{}", handle, edition);
-    #[cfg(not(feature = "localhost_test"))]
-    let url = format!(
-        "https://obstacle.titlepack.io/api/event/{}/{}",
-        handle, edition
-    );
-    tracing::info!("Requesting event edition at {url}...");
-    client
-        .get(&url)
-        .send()
-        .await
-        .context("Failed to send request")?
-        .json()
-        .await
-        .context("Failed to parse JSON from response")
+    imp::get_event_edition(client, "https://obstacle.titlepack.io/api", handle, edition).await
 }
 
 #[tracing::instrument(skip(client), fields(map = %map), err)]
@@ -121,30 +124,23 @@ impl fmt::Display for SimpleEventEdition {
     }
 }
 
-#[tracing::instrument(skip(client, event_handle), err, ret(Display))]
+#[cfg(all(debug_assertions, feature = "localhost_test"))]
+#[inline(always)]
+async fn get_last_edition_of(
+    client: &reqwest::Client,
+    host: &str,
+    event_handle: &str,
+) -> anyhow::Result<SimpleEventEdition> {
+    imp::get_last_edition_of(client, host, event_handle).await
+}
+
+#[cfg(not(all(debug_assertions, feature = "localhost_test")))]
+#[inline(always)]
 async fn get_last_edition_of(
     client: &reqwest::Client,
     event_handle: &str,
 ) -> anyhow::Result<SimpleEventEdition> {
-    #[cfg(feature = "localhost_test")]
-    let url = format!("http://localhost:3001/event/{event_handle}");
-    #[cfg(not(feature = "localhost_test"))]
-    let url = format!("https://obstacle.titlepack.io/api/event/{event_handle}");
-
-    tracing::info!("Requesting event editions at {url}...");
-
-    Ok(
-        client
-            .get(&url)
-            .send()
-            .await?
-            .json::<Vec<SimpleEventEdition>>()
-            .await
-            .context("Unable to parse JSON response for event editions")?
-            .into_iter()
-            .max_by_key(|o| o.id)
-            .unwrap(), // The event must have at least one edition
-    )
+    imp::get_last_edition_of(client, "https::/obstacle.titlepack.io/api", event_handle).await
 }
 
 #[tokio::main]
@@ -159,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
         (Some(event), Some(edition)) => (event, edition),
         (Some(event), None) => {
             tracing::info!("Provided `{event}` event, querying last edition...");
+            #[cfg(all(debug_assertions, feature = "localhost_test"))]
+            let edition = get_last_edition_of(&c, &args.host, &event).await?;
+            #[cfg(not(all(debug_assertions, feature = "localhost_test")))]
             let edition = get_last_edition_of(&c, &event).await?;
             (event, edition.id)
         }
@@ -167,16 +166,18 @@ async fn main() -> anyhow::Result<()> {
         }
         (None, None) => {
             tracing::info!("No parameter provided, querying last edition of campaign...");
-            (
-                "campaign".to_owned(),
-                get_last_edition_of(&c, "campaign").await?.id,
-            )
+            #[cfg(all(debug_assertions, feature = "localhost_test"))]
+            let last_edition_id = get_last_edition_of(&c, &args.host, "campaign").await?.id;
+            #[cfg(not(all(debug_assertions, feature = "localhost_test")))]
+            let last_edition_id = get_last_edition_of(&c, "campaign").await?.id;
+            ("campaign".to_owned(), last_edition_id)
         }
     };
 
-    let event = get_event_edition(&c, &event_handle, event_edition)
-        .await
-        .context("Failed to get event edition")?;
+    #[cfg(all(debug_assertions, feature = "localhost_test"))]
+    let event = get_event_edition(&c, &args.host, &event_handle, event_edition).await?;
+    #[cfg(not(all(debug_assertions, feature = "localhost_test")))]
+    let event = get_event_edition(&c, &event_handle, event_edition).await?;
 
     tracing::info!("Downloading content from MX...");
 
